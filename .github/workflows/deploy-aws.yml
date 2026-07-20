@@ -21,7 +21,7 @@
 #   canary + mainnet -> apps/blockscout-canary/appset-mainnet.yaml
 #
 # Required org-level secret:
-#   CICD_PAT: GitHub PAT with repo access to raylsnetwork/rayls-public-gitops
+#   ARGO_PR: GitHub PAT with repo access to raylsnetwork/rayls-public-gitops
 #             (push branches, open/merge PRs)
 #
 # Required GitHub environment variables (per environment-channel, e.g.
@@ -173,7 +173,7 @@ jobs:
         with:
           repository: ${{ env.GITOPS_REPO }}
           ref: ${{ inputs.gitops_branch }}
-          token: ${{ secrets.CICD_PAT }}
+          token: ${{ secrets.ARGO_PR }}
           path: gitops
 
       - name: Compute branch name
@@ -262,7 +262,7 @@ jobs:
         if: steps.commit.outputs.committed == 'true'
         working-directory: gitops
         env:
-          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          GH_TOKEN: ${{ secrets.ARGO_PR }}
           BRANCH: ${{ steps.branch.outputs.name }}
           BASE: ${{ inputs.gitops_branch }}
           ENVIRONMENT: ${{ inputs.environment }}
@@ -297,7 +297,7 @@ jobs:
         if: steps.commit.outputs.committed == 'true'
         working-directory: gitops
         env:
-          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          GH_TOKEN: ${{ secrets.ARGO_PR }}
           PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
           ENVIRONMENT: ${{ inputs.environment }}
           CHANNEL: ${{ inputs.channel }}
@@ -308,7 +308,7 @@ jobs:
         if: steps.commit.outputs.committed == 'true'
         working-directory: gitops
         env:
-          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          GH_TOKEN: ${{ secrets.ARGO_PR }}
           PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
         run: |
           echo "🔀 Auto-merging PR #$PR_NUMBER"
