@@ -3,8 +3,9 @@
 # =============================================================================
 # Builds the frontend image, pushes it to AWS ECR (OIDC, same pattern as
 # blockscout-backend/.github/workflows/build-and-push.yml), then patches the
-# frontend image tag directly in the target ArgoCD ApplicationSet inside
-# raylsnetwork/rayls-public-gitops. ArgoCD auto-syncs after the commit lands.
+# frontend image tag in the target ArgoCD ApplicationSet inside
+# raylsnetwork/rayls-public-gitops via a PR that auto-merges (same pattern as
+# this repo's _update-helm.yml). ArgoCD auto-syncs once the PR merges.
 #
 # Target is chosen by two independent inputs:
 #   environment: testnet | mainnet
@@ -20,7 +21,8 @@
 #   canary + mainnet -> apps/blockscout-canary/appset-mainnet.yaml
 #
 # Required org-level secret:
-#   CICD_PAT: GitHub PAT with push access to raylsnetwork/rayls-public-gitops
+#   CICD_PAT: GitHub PAT with repo access to raylsnetwork/rayls-public-gitops
+#             (push branches, open/merge PRs)
 #
 # Required GitHub environment variables (per environment-channel, e.g.
 # "testnet-canary", "mainnet-stable"):
@@ -174,6 +176,34 @@ jobs:
           token: ${{ secrets.CICD_PAT }}
           path: gitops
 
+      - name: Compute branch name
+        id: branch
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CHANNEL: ${{ inputs.channel }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          echo "name=deploy-${ENVIRONMENT}-${CHANNEL}-${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Git and Branch
+        working-directory: gitops
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin
+
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "📌 Branch $BRANCH already exists, checking it out..."
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH" --rebase
+          else
+            echo "🆕 Creating new branch $BRANCH"
+            git checkout -b "$BRANCH"
+          fi
+
       - name: Patch frontend image tag
         working-directory: gitops
         env:
@@ -201,15 +231,12 @@ jobs:
         id: commit
         working-directory: gitops
         env:
-          BRANCH: ${{ inputs.gitops_branch }}
+          BRANCH: ${{ steps.branch.outputs.name }}
           TAG: ${{ steps.tag.outputs.tag }}
           ENVIRONMENT: ${{ inputs.environment }}
           CHANNEL: ${{ inputs.channel }}
           TRIGGER_SHA: ${{ github.sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add .
 
           if git diff --staged --quiet; then
@@ -227,8 +254,65 @@ jobs:
           - Image: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
           - Triggered by: ${{ github.repository }}@$TRIGGER_SHA"
 
-          git push origin "HEAD:$BRANCH"
+          git push origin "$BRANCH" --force-with-lease
           echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or Update Pull Request
+        id: create-pr
+        if: steps.commit.outputs.committed == 'true'
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          BASE: ${{ inputs.gitops_branch }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          CHANNEL: ${{ inputs.channel }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          FILE: ${{ steps.target.outputs.file }}
+        run: |
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null)
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "📝 PR #$EXISTING_PR already exists for branch $BRANCH"
+            PR_URL="https://github.com/${{ env.GITOPS_REPO }}/pull/$EXISTING_PR"
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+          else
+            echo "🆕 Creating new PR for branch $BRANCH"
+
+            PR_URL=$(gh pr create \
+              --title "chore(rayls-explorer-frontend): deploy $TAG to $ENVIRONMENT/$CHANNEL" \
+              --body "Automated Deploy (AWS) — Environment: $ENVIRONMENT, Channel: $CHANNEL, Image Tag: $TAG, Appset: $FILE" \
+              --base "$BASE" \
+              --head "$BRANCH")
+
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+            echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "📎 PR: $PR_URL"
+
+      - name: Add Labels to PR
+        if: steps.commit.outputs.committed == 'true'
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          gh pr edit "$PR_NUMBER" --add-label "automated,deploy-aws,$ENVIRONMENT,$CHANNEL" 2>/dev/null || echo "⚠️  Labels not added (they may not exist in the repository)"
+
+      - name: Auto-Merge PR
+        if: steps.commit.outputs.committed == 'true'
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pr_number }}
+        run: |
+          echo "🔀 Auto-merging PR #$PR_NUMBER"
+          gh pr merge "$PR_NUMBER" --squash --auto --delete-branch
 
       - name: Summary
         env:
@@ -237,6 +321,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           FILE: ${{ steps.target.outputs.file }}
           COMMITTED: ${{ steps.commit.outputs.committed }}
+          PR_URL: ${{ steps.create-pr.outputs.pr_url }}
         run: |
           {
             echo "## 📦 Deploy (AWS)"
@@ -251,8 +336,10 @@ jobs:
 
           if [[ "$COMMITTED" == "true" ]]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "🔄 ArgoCD will automatically sync the deployment." >> "$GITHUB_STEP_SUMMARY"
+            echo "| PR | $PR_URL |" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "🔄 PR auto-merges, then ArgoCD will sync the deployment." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "ℹ️ Tag was already set — no commit made." >> "$GITHUB_STEP_SUMMARY"
+            echo "ℹ️ Tag was already set — no PR opened." >> "$GITHUB_STEP_SUMMARY"
           fi
